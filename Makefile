@@ -209,7 +209,8 @@ NVCC ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?= sm_121
 CUDA_CFLAGS := -std=c11 -O3 -MMD -MP -Wall -Wextra -Wpedantic -Wshadow \
 	-Wno-sign-conversion -D_GNU_SOURCE -DH3_CUDA
-CUDA_LDLIBS := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lm
+CUDA_LDLIBS := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lm \
+	-l:libicuuc.so.74 -l:libicudata.so.74
 
 CUDA_C_SRC := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
 	h3_dit_schedule.c h3_dit.c h3_video_vae.c h3_video_encoder.c h3_audio_vae.c \
