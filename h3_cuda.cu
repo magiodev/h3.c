@@ -608,6 +608,96 @@ __global__ void h3_cu_geglu_f32(const float *gate, const float *lin, float *o, u
     if (i < n) { float x = gate[i]; float c = x*x*x;
         o[i] = 0.5f*x*(1.0f + tanhf(0.7978845608028654f*(x + 0.044715f*c))) * lin[i]; }
 }
+/* Conv1d (stride 1). Layouts: input NHWC [b,length,ic], weight OIHW
+ * [oc,ic,kernel], output NHWC [b,output_length,oc]. */
+__global__ void h3_cu_conv1d_f32(const float *input, const float *weight,
+        const float *bias, float *output, unsigned batch, unsigned length,
+        unsigned input_channels, unsigned output_channels, unsigned kernel,
+        unsigned padding, unsigned dilation) {
+    unsigned effective = dilation*(kernel-1)+1;
+    unsigned output_length = (length + 2*padding - effective) + 1;
+    size_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
+    size_t total = (size_t)batch*output_length*output_channels;
+    if (idx >= total) return;
+    unsigned oc = (unsigned)(idx % output_channels);
+    unsigned t = (unsigned)((idx / output_channels) % output_length);
+    unsigned b = (unsigned)(idx / (output_channels*output_length));
+    float acc = bias ? bias[oc] : 0.0f;
+    const float *w = weight + (size_t)oc*input_channels*kernel;
+    const float *x = input + (size_t)b*length*input_channels;
+    for (unsigned ic = 0; ic < input_channels; ic++) {
+        const float *wi = w + (size_t)ic*kernel;
+        const float *xi = x + ic;
+        for (unsigned k = 0; k < kernel; k++) {
+            int in_t = (int)(t + k*dilation) - (int)padding;
+            if (in_t < 0 || in_t >= (int)length) continue;
+            acc = fmaf(xi[(size_t)in_t*input_channels], wi[k], acc);
+        }
+    }
+    output[idx] = acc;
+}
+/* ConvTranspose1d. Layouts: input NHWC [b,length,ic], weight transposed-OIHW
+ * [ic,oc,kernel], output NHWC [b,output_length,oc]. */
+__global__ void h3_cu_conv_transpose1d_f32(const float *input,
+        const float *weight, const float *bias, float *output, unsigned batch,
+        unsigned length, unsigned input_channels, unsigned output_channels,
+        unsigned kernel, unsigned stride, unsigned padding) {
+    unsigned output_length = (length-1)*stride + kernel - 2*padding;
+    size_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
+    size_t total = (size_t)batch*output_length*output_channels;
+    if (idx >= total) return;
+    unsigned oc = (unsigned)(idx % output_channels);
+    unsigned t = (unsigned)((idx / output_channels) % output_length);
+    unsigned b = (unsigned)(idx / (output_channels*output_length));
+    float acc = bias ? bias[oc] : 0.0f;
+    const float *x = input + (size_t)b*length*input_channels;
+    for (unsigned ic = 0; ic < input_channels; ic++) {
+        const float *wi = weight + (size_t)ic*output_channels*kernel + oc*kernel;
+        const float *xi = x + ic;
+        for (unsigned k = 0; k < kernel; k++) {
+            int num = (int)t + (int)padding - (int)k;
+            if (num < 0 || num % (int)stride != 0) continue;
+            int in_t = num / (int)stride;
+            if (in_t < 0 || in_t >= (int)length) continue;
+            acc = fmaf(xi[(size_t)in_t*input_channels], wi[k], acc);
+        }
+    }
+    output[idx] = acc;
+}
+/* Alias-free SnakeBeta activation: 3D grid (channels, length, batch). */
+__global__ void h3_cu_alias_free_snake_f32(const float *input,
+        const float *alpha_log, const float *beta_log,
+        const float *upsample_filter, const float *downsample_filter,
+        float *output, unsigned batch, unsigned length, unsigned channels) {
+    unsigned channel = blockIdx.x*blockDim.x + threadIdx.x;
+    unsigned time = blockIdx.y;
+    unsigned b = blockIdx.z;
+    if (channel >= channels || time >= length || b >= batch) return;
+    float alpha = expf(alpha_log[channel]);
+    float beta = expf(beta_log[channel]);
+    float result = 0.0f;
+    for (int down_k = 0; down_k < 12; down_k++) {
+        int up_time = (int)(time*2) + down_k - 5;
+        up_time = max(up_time, 0);
+        up_time = min(up_time, (int)(length*2) - 1);
+        int raw_time = up_time + 15;
+        float upsampled = 0.0f;
+        for (int up_k = 0; up_k < 12; up_k++) {
+            int numerator = raw_time - up_k;
+            if (numerator < 0 || (numerator & 1)) continue;
+            int padded_time = numerator / 2;
+            int source_time = padded_time - 5;
+            source_time = max(source_time, 0);
+            source_time = min(source_time, (int)length - 1);
+            const float *src = input + ((size_t)b*length + (unsigned)source_time)*channels + channel;
+            upsampled = fmaf(src[0], 2.0f*upsample_filter[up_k], upsampled);
+        }
+        float sine = sinf(alpha*upsampled);
+        float activated = upsampled + sine*sine/(beta + 1e-9f);
+        result = fmaf(activated, downsample_filter[down_k], result);
+    }
+    output[(size_t)((size_t)b*length + time)*channels + channel] = result;
+}
 __global__ void h3_cu_gelu_bf16(const uint16_t *in, uint16_t *o, unsigned n, int approx) {
     unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) { float v = h3_bf16_to_f32(in[i]); float act;
@@ -1216,7 +1306,31 @@ int h3_gpu_conv1d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                       const h3_gpu_tensor *bias, uint32_t batch,
                       uint32_t length, uint32_t input_channels,
                       uint32_t output_channels, uint32_t kernel,
-                      uint32_t padding, uint32_t dilation) { h3_cuda_seterr(gpu); return (int)0; }
+                      uint32_t padding, uint32_t dilation) {
+    if (!gpu || !output || !input || !weight || !batch || !length ||
+        !input_channels || !output_channels || !kernel || !dilation)
+        return 0;
+    uint64_t effective = (uint64_t)dilation * (kernel - 1) + 1;
+    if ((uint64_t)length + 2*padding < effective) return 0;
+    uint32_t output_length = (uint32_t)((length + 2*padding - effective) + 1);
+    size_t input_count = (size_t)batch * length * input_channels;
+    size_t weight_count = (size_t)output_channels * input_channels * kernel;
+    size_t output_count = (size_t)batch * output_length * output_channels;
+    if (!output->device_ptr || !input->device_ptr || !weight->device_ptr ||
+        output_count > output->elements || input_count > input->elements ||
+        weight_count > weight->elements || output_count > UINT32_MAX)
+        return 0;
+    if (bias && (!bias->device_ptr || output_channels > bias->elements))
+        return 0;
+    if ((size_t)output_channels * input_channels * kernel > UINT32_MAX)
+        return 0;
+    h3_cu_conv1d_f32<<<h3_cu_grid(output_count), H3_CU_BLOCK>>>(
+        (const float *)input->device_ptr, (const float *)weight->device_ptr,
+        bias ? (const float *)bias->device_ptr : NULL,
+        (float *)output->device_ptr, batch, length, input_channels,
+        output_channels, kernel, padding, dilation);
+    return 1;
+}
 int h3_gpu_conv1d_stride_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                       const h3_gpu_tensor *input,
                       const h3_gpu_tensor *weight,
@@ -1224,7 +1338,12 @@ int h3_gpu_conv1d_stride_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                       uint32_t length, uint32_t input_channels,
                       uint32_t output_channels, uint32_t kernel,
                       uint32_t stride, uint32_t padding,
-                      uint32_t dilation) { h3_cuda_seterr(gpu); return (int)0; }
+                      uint32_t dilation) {
+    (void)gpu; (void)output; (void)input; (void)weight; (void)bias;
+    (void)batch; (void)length; (void)input_channels; (void)output_channels;
+    (void)kernel; (void)stride; (void)padding; (void)dilation;
+    return 0;
+}
 int h3_gpu_conv_transpose1d_f32(
                       h3_gpu *gpu, h3_gpu_tensor *output,
                       const h3_gpu_tensor *input,
@@ -1232,7 +1351,29 @@ int h3_gpu_conv_transpose1d_f32(
                       const h3_gpu_tensor *bias, uint32_t batch,
                       uint32_t length, uint32_t input_channels,
                       uint32_t output_channels, uint32_t kernel,
-                      uint32_t stride, uint32_t padding) { h3_cuda_seterr(gpu); return (int)0; }
+                      uint32_t stride, uint32_t padding) {
+    if (!gpu || !output || !input || !weight || !batch || !length ||
+        !input_channels || !output_channels || !kernel || !stride ||
+        (uint64_t)(length - 1) * stride + kernel < 2 * padding)
+        return 0;
+    uint32_t output_length = (uint32_t)((uint64_t)(length - 1) * stride +
+                                        kernel - 2 * padding);
+    size_t input_count = (size_t)batch * length * input_channels;
+    size_t weight_count = (size_t)input_channels * output_channels * kernel;
+    size_t output_count = (size_t)batch * output_length * output_channels;
+    if (!output->device_ptr || !input->device_ptr || !weight->device_ptr ||
+        output_count > output->elements || input_count > input->elements ||
+        weight_count > weight->elements || output_count > UINT32_MAX)
+        return 0;
+    if (bias && (!bias->device_ptr || output_channels > bias->elements))
+        return 0;
+    h3_cu_conv_transpose1d_f32<<<h3_cu_grid(output_count), H3_CU_BLOCK>>>(
+        (const float *)input->device_ptr, (const float *)weight->device_ptr,
+        bias ? (const float *)bias->device_ptr : NULL,
+        (float *)output->device_ptr, batch, length, input_channels,
+        output_channels, kernel, stride, padding);
+    return 1;
+}
 int h3_gpu_weight_norm_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                            const h3_gpu_tensor *vector,
                            const h3_gpu_tensor *magnitude,
@@ -1257,7 +1398,28 @@ int h3_gpu_alias_free_snake_f32(
                           const h3_gpu_tensor *upsample_filter,
                           const h3_gpu_tensor *downsample_filter,
                           uint32_t batch, uint32_t length,
-                          uint32_t channels) { h3_cuda_seterr(gpu); return (int)0; }
+                          uint32_t channels) {
+    if (!gpu || !output || !input || !alpha_log || !beta_log ||
+        !upsample_filter || !downsample_filter || !batch || !length ||
+        !channels)
+        return 0;
+    size_t count = (size_t)batch * length * channels;
+    if (!output->device_ptr || !input->device_ptr || !alpha_log->device_ptr ||
+        !beta_log->device_ptr || !upsample_filter->device_ptr ||
+        !downsample_filter->device_ptr || count > output->elements ||
+        count > input->elements || channels > alpha_log->elements ||
+        channels > beta_log->elements || 12 > upsample_filter->elements ||
+        12 > downsample_filter->elements)
+        return 0;
+    dim3 g(h3_cu_grid(channels), length, batch);
+    h3_cu_alias_free_snake_f32<<<g, H3_CU_BLOCK>>>(
+        (const float *)input->device_ptr, (const float *)alpha_log->device_ptr,
+        (const float *)beta_log->device_ptr,
+        (const float *)upsample_filter->device_ptr,
+        (const float *)downsample_filter->device_ptr,
+        (float *)output->device_ptr, batch, length, channels);
+    return 1;
+}
 int h3_gpu_snake1d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                        const h3_gpu_tensor *input,
                        const h3_gpu_tensor *alpha, uint32_t batch,
