@@ -72,6 +72,148 @@ __global__ void h3_cu_linear_bias_bf16(uint16_t *out, const uint16_t *bias,
     }
 }
 
+/* --- I5: attention --- */
+
+template <typename T> __device__ float h3_cu_load(const T *p) { return (float)*p; }
+template <> __device__ float h3_cu_load<uint16_t>(const uint16_t *p) { return h3_bf16_to_f32(*p); }
+template <typename T> __device__ void h3_cu_store(T *p, float v) { *p = (T)v; }
+template <> __device__ void h3_cu_store<uint16_t>(uint16_t *p, float v) { *p = h3_f32_to_bf16(v); }
+
+/* Flash-style softmax attention. Q/K/V row-major [batch, row, head, dim].
+ * Online softmax (rescaling) to keep one pass over the sequence. head_major_out
+ * writes [batch, head, row, dim] (native SDPA layout) instead of row-major. */
+template <typename T>
+__global__ void h3_cu_sdpa(T *out, const T *q, const T *k, const T *v,
+                           uint32_t batch, uint32_t seq, uint32_t heads,
+                           uint32_t head_dim, float scale, int causal,
+                           int head_major_out) {
+    uint32_t head = blockIdx.x, row = blockIdx.y, b = blockIdx.z;
+    uint32_t d = threadIdx.x;
+    if (head >= heads || row >= seq || d >= head_dim || b >= batch) return;
+    uint32_t bbase = b * seq * heads * head_dim;
+    float qv = h3_cu_load(&q[bbase + (row * heads + head) * head_dim + d]);
+    float m = -INFINITY, l = 0.0f, acc = 0.0f;
+    __shared__ float red[H3_CU_BLOCK];
+    for (uint32_t s = 0; s < seq; s++) {
+        if (causal && s > row) break;
+        red[d] = qv * h3_cu_load(&k[bbase + (s * heads + head) * head_dim + d]);
+        __syncthreads();
+        for (int st = (int)blockDim.x / 2; st > 0; st >>= 1) {
+            if (d < (uint32_t)st) red[d] += red[d + st];
+            __syncthreads();
+        }
+        float score = red[0] * scale;
+        __syncthreads();
+        float m_new = fmaxf(m, score);
+        float es = expf(m - m_new);
+        float e = expf(score - m_new);
+        l = l * es + e;
+        acc *= es;
+        acc += e * h3_cu_load(&v[bbase + (s * heads + head) * head_dim + d]);
+        m = m_new;
+    }
+    float o = (l > 0.0f) ? acc / l : 0.0f;
+    uint32_t out = bbase + (head_major_out ? (head * seq + row) : (row * heads + head))
+        * head_dim + d;
+    h3_cu_store(&out[out], o);
+}
+
+/* DiT grouped QKV+RoPE (BF16): qkv row = [head0:Q|K|V][head1:Q|K|V]... (grouped).
+ * Per (row,head): RMS-norm Q and K (rsqrt(sum/head_dim+eps)), RoPE +/-half pairs,
+ * V copied raw. Output row-major [row, head, dim]. Mirrors h3_qkv_rope_bf16. */
+__global__ void h3_cu_grouped_qkv_rope_bf16(
+    const uint16_t *qkv, const uint16_t *q_weight, const uint16_t *k_weight,
+    const uint16_t *rope_cos, const uint16_t *rope_sin,
+    uint16_t *query, uint16_t *key, uint16_t *value,
+    uint32_t seq, uint32_t heads, uint32_t head_dim, uint32_t rope_half, float epsilon) {
+    uint32_t head = blockIdx.x, row = blockIdx.y, d = threadIdx.x;
+    if (head >= heads || row >= seq || d >= head_dim) return;
+    uint32_t inner = heads * head_dim;
+    uint32_t row_base = row * inner * 3;
+    uint32_t q_base = row_base + head * head_dim * 3;
+    uint32_t k_base = q_base + head_dim;
+    uint32_t v_base = k_base + head_dim;
+    float q = h3_bf16_to_f32(qkv[q_base + d]);
+    float k = h3_bf16_to_f32(qkv[k_base + d]);
+    __shared__ float qs[H3_CU_BLOCK], ks[H3_CU_BLOCK];
+    qs[d] = q * q; ks[d] = k * k;
+    __syncthreads();
+    for (int st = (int)blockDim.x / 2; st > 0; st >>= 1) {
+        if (d < (uint32_t)st) { qs[d] += qs[d + st]; ks[d] += ks[d + st]; }
+        __syncthreads();
+    }
+    float qi = rsqrtf(qs[0] / (float)head_dim + epsilon);
+    float ki = rsqrtf(ks[0] / (float)head_dim + epsilon);
+    float q0 = q * qi * h3_bf16_to_f32(q_weight[d]);
+    float k0 = k * ki * h3_bf16_to_f32(k_weight[d]);
+    if (d < rope_half) {
+        uint32_t pair = d + rope_half;
+        float q1 = h3_bf16_to_f32(qkv[q_base + pair]) * qi * h3_bf16_to_f32(q_weight[pair]);
+        float k1 = h3_bf16_to_f32(qkv[k_base + pair]) * ki * h3_bf16_to_f32(k_weight[pair]);
+        float c = h3_bf16_to_f32(rope_cos[row * rope_half + d]);
+        float s = h3_bf16_to_f32(rope_sin[row * rope_half + d]);
+        q0 = q0 * c - q1 * s;
+        k0 = k0 * c - k1 * s;
+    } else if (d < rope_half * 2) {
+        uint32_t pair = d - rope_half;
+        float q1 = h3_bf16_to_f32(qkv[q_base + pair]) * qi * h3_bf16_to_f32(q_weight[pair]);
+        float k1 = h3_bf16_to_f32(qkv[k_base + pair]) * ki * h3_bf16_to_f32(k_weight[pair]);
+        float c = h3_bf16_to_f32(rope_cos[row * rope_half + pair]);
+        float s = h3_bf16_to_f32(rope_sin[row * rope_half + pair]);
+        q0 = q0 * c + q1 * s;
+        k0 = k0 * c + k1 * s;
+    }
+    uint32_t out = (row * heads + head) * head_dim + d;
+    query[out] = h3_f32_to_bf16(q0);
+    key[out] = h3_f32_to_bf16(k0);
+    value[out] = qkv[v_base + d];
+}
+
+/* Video VAE QKV+RoPE (f32): qkv row = [head0:Q|K|V][head1:Q|K|V]..., raw rsqrt norm
+ * (no learned weight). Mirrors h3_video_qkv_rope_f32. */
+__global__ void h3_cu_video_qkv_rope_f32(
+    const float *qkv, const float *rope_cos, const float *rope_sin,
+    float *query, float *key, float *value,
+    uint32_t seq, uint32_t heads, uint32_t head_dim, uint32_t rope_half, float epsilon) {
+    uint32_t head = blockIdx.x, row = blockIdx.y, d = threadIdx.x;
+    if (head >= heads || row >= seq || d >= head_dim) return;
+    uint32_t base = (row * heads + head) * head_dim * 3;
+    float q = qkv[base + d];
+    float k = qkv[base + head_dim + d];
+    __shared__ float qs[H3_CU_BLOCK], ks[H3_CU_BLOCK];
+    qs[d] = q * q; ks[d] = k * k;
+    __syncthreads();
+    for (int st = (int)blockDim.x / 2; st > 0; st >>= 1) {
+        if (d < (uint32_t)st) { qs[d] += qs[d + st]; ks[d] += ks[d + st]; }
+        __syncthreads();
+    }
+    float qi = rsqrtf(qs[0] / (float)head_dim + epsilon);
+    float ki = rsqrtf(ks[0] / (float)head_dim + epsilon);
+    float q0 = q * qi, k0 = k * ki;
+    if (d < rope_half) {
+        uint32_t pair = d + rope_half;
+        float q1 = qkv[base + pair] * qi;
+        float k1 = qkv[base + head_dim + pair] * ki;
+        float c = rope_cos[row * rope_half + d];
+        float s = rope_sin[row * rope_half + d];
+        q0 = q0 * c - q1 * s;
+        k0 = k0 * c - k1 * s;
+    } else if (d < rope_half * 2) {
+        uint32_t pair = d - rope_half;
+        float q1 = qkv[base + pair] * qi;
+        float k1 = qkv[base + head_dim + pair] * ki;
+        float c = rope_cos[row * rope_half + pair];
+        float s = rope_sin[row * rope_half + pair];
+        q0 = q0 * c + q1 * s;
+        k0 = k0 * c + k1 * s;
+    }
+    uint32_t out = (row * heads + head) * head_dim + d;
+    query[out] = q0;
+    key[out] = k0;
+    value[out] = qkv[base + 2 * head_dim + d];
+}
+
+
 static size_t h3_gpu_dtype_size(h3_gpu_dtype dtype) {
     switch (dtype) {
     case H3_GPU_F32: return sizeof(float);
@@ -623,7 +765,16 @@ int h3_gpu_qkv_rope_f32(h3_gpu *gpu, h3_gpu_tensor *query,
 int h3_gpu_sdpa_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                     const h3_gpu_tensor *value, uint32_t sequence,
-                    uint32_t heads, uint32_t head_dim, float scale) { h3_cuda_seterr(gpu); return (int)0; }
+                    uint32_t heads, uint32_t head_dim, float scale) {
+    if (!gpu || !output || !query || !key || !value || !output->device_ptr ||
+        !query->device_ptr || !key->device_ptr || !value->device_ptr) return 0;
+    if (head_dim > H3_CU_BLOCK || head_dim == 0) return 0;
+    dim3 g(heads, sequence, 1);
+    h3_cu_sdpa<float><<<g, head_dim>>>((float *)output->device_ptr,
+        (const float *)query->device_ptr, (const float *)key->device_ptr,
+        (const float *)value->device_ptr, 1, sequence, heads, head_dim, scale, 0, 0);
+    return 1;
+}
 int h3_gpu_swiglu_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                       const h3_gpu_tensor *fused, uint32_t rows,
                       uint32_t width) {
@@ -658,7 +809,18 @@ int h3_gpu_video_qkv_rope_f32(h3_gpu *gpu, h3_gpu_tensor *query,
                               const h3_gpu_tensor *rope_sin,
                               uint32_t sequence, uint32_t heads,
                               uint32_t head_dim, uint32_t rope_half,
-                              float epsilon) { h3_cuda_seterr(gpu); return (int)0; }
+                              float epsilon) {
+    if (!gpu || !query || !key || !value || !qkv || !rope_cos || !rope_sin ||
+        !query->device_ptr || !key->device_ptr || !value->device_ptr ||
+        !qkv->device_ptr || !rope_cos->device_ptr || !rope_sin->device_ptr) return 0;
+    if (head_dim > H3_CU_BLOCK || head_dim == 0) return 0;
+    dim3 g(heads, sequence, 1);
+    h3_cu_video_qkv_rope_f32<<<g, head_dim>>>((float *)query->device_ptr,
+        (float *)key->device_ptr, (float *)value->device_ptr,
+        (const float *)qkv->device_ptr, (const float *)rope_cos->device_ptr,
+        (const float *)rope_sin->device_ptr, sequence, heads, head_dim, rope_half, epsilon);
+    return 1;
+}
 int h3_gpu_conv1d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                       const h3_gpu_tensor *input,
                       const h3_gpu_tensor *weight,
@@ -724,7 +886,16 @@ int h3_gpu_sdpa_causal_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                        const h3_gpu_tensor *key,
                        const h3_gpu_tensor *value, uint32_t batch,
                        uint32_t sequence, uint32_t heads,
-                       uint32_t head_dim, float scale) { h3_cuda_seterr(gpu); return (int)0; }
+                       uint32_t head_dim, float scale) {
+    if (!gpu || !output || !query || !key || !value || !output->device_ptr ||
+        !query->device_ptr || !key->device_ptr || !value->device_ptr) return 0;
+    if (head_dim > H3_CU_BLOCK || head_dim == 0) return 0;
+    dim3 g(heads, sequence, batch);
+    h3_cu_sdpa<float><<<g, head_dim>>>((float *)output->device_ptr,
+        (const float *)query->device_ptr, (const float *)key->device_ptr,
+        (const float *)value->device_ptr, batch, sequence, heads, head_dim, scale, 1, 0);
+    return 1;
+}
 int h3_gpu_audio_attention_pool_f32(h3_gpu *gpu,
                        h3_gpu_tensor *output,
                        const h3_gpu_tensor *attended, uint32_t batch,
@@ -958,7 +1129,20 @@ int h3_gpu_grouped_qkv_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
                                  const h3_gpu_tensor *rope_sin,
                                  uint32_t sequence, uint32_t heads,
                                  uint32_t head_dim, uint32_t rope_half,
-                                 float epsilon) { h3_cuda_seterr(gpu); return (int)0; }
+                                 float epsilon) {
+    if (!gpu || !query || !key || !value || !qkv || !q_norm || !k_norm ||
+        !rope_cos || !rope_sin || !query->device_ptr || !key->device_ptr ||
+        !value->device_ptr || !qkv->device_ptr || !q_norm->device_ptr ||
+        !k_norm->device_ptr || !rope_cos->device_ptr || !rope_sin->device_ptr) return 0;
+    if (head_dim > H3_CU_BLOCK || head_dim == 0) return 0;
+    dim3 g(heads, sequence, 1);
+    h3_cu_grouped_qkv_rope_bf16<<<g, head_dim>>>((uint16_t *)query->device_ptr,
+        (uint16_t *)key->device_ptr, (uint16_t *)value->device_ptr,
+        (const uint16_t *)qkv->device_ptr, (const uint16_t *)q_norm->device_ptr,
+        (const uint16_t *)k_norm->device_ptr, (const uint16_t *)rope_cos->device_ptr,
+        (const uint16_t *)rope_sin->device_ptr, sequence, heads, head_dim, rope_half, epsilon);
+    return 1;
+}
 int h3_gpu_grouped_qkv_linear_rope_bf16(
                                  h3_gpu *gpu,
                                  h3_gpu_tensor *query,
@@ -998,12 +1182,30 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
 int h3_gpu_sdpa_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                      const h3_gpu_tensor *value, uint32_t sequence,
-                     uint32_t heads, uint32_t head_dim, float scale) { h3_cuda_seterr(gpu); return (int)0; }
+                     uint32_t heads, uint32_t head_dim, float scale) {
+    if (!gpu || !output || !query || !key || !value || !output->device_ptr ||
+        !query->device_ptr || !key->device_ptr || !value->device_ptr) return 0;
+    if (head_dim > H3_CU_BLOCK || head_dim == 0) return 0;
+    dim3 g(heads, sequence, 1);
+    h3_cu_sdpa<uint16_t><<<g, head_dim>>>((uint16_t *)output->device_ptr,
+        (const uint16_t *)query->device_ptr, (const uint16_t *)key->device_ptr,
+        (const uint16_t *)value->device_ptr, 1, sequence, heads, head_dim, scale, 0, 0);
+    return 1;
+}
 int h3_gpu_sdpa_bf16_head_major_output(
                      h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                      const h3_gpu_tensor *value, uint32_t sequence,
-                     uint32_t heads, uint32_t head_dim, float scale) { h3_cuda_seterr(gpu); return (int)0; }
+                     uint32_t heads, uint32_t head_dim, float scale) {
+    if (!gpu || !output || !query || !key || !value || !output->device_ptr ||
+        !query->device_ptr || !key->device_ptr || !value->device_ptr) return 0;
+    if (head_dim > H3_CU_BLOCK || head_dim == 0) return 0;
+    dim3 g(heads, sequence, 1);
+    h3_cu_sdpa<uint16_t><<<g, head_dim>>>((uint16_t *)output->device_ptr,
+        (const uint16_t *)query->device_ptr, (const uint16_t *)key->device_ptr,
+        (const uint16_t *)value->device_ptr, 1, sequence, heads, head_dim, scale, 0, 1);
+    return 1;
+}
 int h3_gpu_swiglu_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                        const h3_gpu_tensor *fused, uint32_t rows,
                        uint32_t width) {
