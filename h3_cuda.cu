@@ -113,9 +113,9 @@ __global__ void h3_cu_sdpa(T *out, const T *q, const T *k, const T *v,
         m = m_new;
     }
     float o = (l > 0.0f) ? acc / l : 0.0f;
-    uint32_t out = bbase + (head_major_out ? (head * seq + row) : (row * heads + head))
+    uint32_t idx = bbase + (head_major_out ? (head * seq + row) : (row * heads + head))
         * head_dim + d;
-    h3_cu_store(&out[out], o);
+    h3_cu_store(&out[idx], o);
 }
 
 /* DiT grouped QKV+RoPE (BF16): qkv row = [head0:Q|K|V][head1:Q|K|V]... (grouped).
@@ -815,10 +815,11 @@ int h3_gpu_video_qkv_rope_f32(h3_gpu *gpu, h3_gpu_tensor *query,
         !qkv->device_ptr || !rope_cos->device_ptr || !rope_sin->device_ptr) return 0;
     if (head_dim > H3_CU_BLOCK || head_dim == 0) return 0;
     dim3 g(heads, sequence, 1);
-    h3_cu_video_qkv_rope_f32<<<g, head_dim>>>((float *)query->device_ptr,
-        (float *)key->device_ptr, (float *)value->device_ptr,
+    h3_cu_video_qkv_rope_f32<<<g, head_dim>>>(
         (const float *)qkv->device_ptr, (const float *)rope_cos->device_ptr,
-        (const float *)rope_sin->device_ptr, sequence, heads, head_dim, rope_half, epsilon);
+        (const float *)rope_sin->device_ptr, (float *)query->device_ptr,
+        (float *)key->device_ptr, (float *)value->device_ptr,
+        sequence, heads, head_dim, rope_half, epsilon);
     return 1;
 }
 int h3_gpu_conv1d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -1136,11 +1137,12 @@ int h3_gpu_grouped_qkv_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
         !k_norm->device_ptr || !rope_cos->device_ptr || !rope_sin->device_ptr) return 0;
     if (head_dim > H3_CU_BLOCK || head_dim == 0) return 0;
     dim3 g(heads, sequence, 1);
-    h3_cu_grouped_qkv_rope_bf16<<<g, head_dim>>>((uint16_t *)query->device_ptr,
-        (uint16_t *)key->device_ptr, (uint16_t *)value->device_ptr,
+    h3_cu_grouped_qkv_rope_bf16<<<g, head_dim>>>(
         (const uint16_t *)qkv->device_ptr, (const uint16_t *)q_norm->device_ptr,
         (const uint16_t *)k_norm->device_ptr, (const uint16_t *)rope_cos->device_ptr,
-        (const uint16_t *)rope_sin->device_ptr, sequence, heads, head_dim, rope_half, epsilon);
+        (const uint16_t *)rope_sin->device_ptr, (uint16_t *)query->device_ptr,
+        (uint16_t *)key->device_ptr, (uint16_t *)value->device_ptr,
+        sequence, heads, head_dim, rope_half, epsilon);
     return 1;
 }
 int h3_gpu_grouped_qkv_linear_rope_bf16(
