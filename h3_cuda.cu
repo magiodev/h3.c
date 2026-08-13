@@ -72,6 +72,25 @@ __global__ void h3_cu_linear_bias_bf16(uint16_t *out, const uint16_t *bias,
     }
 }
 
+/* f32 GEMM result + f32 bias -> bf16 output (patch_linear, f32 bias). */
+__global__ void h3_cu_bias_f32_to_bf16(const float *gemm, const float *bias,
+                                       uint16_t *out, uint32_t rows, uint32_t out_dim) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < rows * out_dim) {
+        uint32_t col = i % out_dim;
+        out[i] = h3_f32_to_bf16(gemm[i] + (bias ? bias[col] : 0.0f));
+    }
+}
+
+/* Gather rows: dst[r*in+d] = src[row_map[r]*in+d]. */
+__global__ void h3_cu_copy_rows_f32(const float *src, const unsigned *row_map,
+                                    float *dst, uint32_t rows, uint32_t width) {
+    uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t row = blockIdx.y;
+    if (row >= rows || col >= width) return;
+    dst[(size_t)row * width + col] = src[(size_t)row_map[row] * width + col];
+}
+
 /* --- I5: attention --- */
 
 template <typename T> __device__ float h3_cu_load(const T *p) { return (float)*p; }
@@ -211,6 +230,334 @@ __global__ void h3_cu_video_qkv_rope_f32(
     query[out] = q0;
     key[out] = k0;
     value[out] = qkv[base + 2 * head_dim + d];
+}
+
+/* --- I6: DiT aux + text encoder --- */
+
+#define H3_DIT_MAX 5376u
+
+/* RMS inverse per row: inverse[row] = rsqrt(sum(x^2)/width + eps). F32 out. */
+__global__ void h3_cu_rms_inverse_bf16(const uint16_t *input, float *inverse,
+                                       uint32_t rows, uint32_t width, float epsilon) {
+    uint32_t row = blockIdx.x, tid = threadIdx.x;
+    if (row >= rows) return;
+    const uint16_t *x = input + (size_t)row * width;
+    float local_sum = 0.0f;
+    for (uint32_t k = tid; k < width; k += blockDim.x) {
+        float v = h3_bf16_to_f32(x[k]);
+        local_sum = fmaf(v, v, local_sum);
+    }
+    __shared__ float red[H3_CU_BLOCK];
+    red[tid] = local_sum;
+    __syncthreads();
+    for (int st = (int)blockDim.x / 2; st > 0; st >>= 1) {
+        if (tid < (uint32_t)st) red[tid] += red[tid + st];
+        __syncthreads();
+    }
+    inverse[row] = rsqrtf(red[0] / (float)width + epsilon);
+}
+
+/* AdaLN: RMS norm + modulation scale/shift. Block per row. */
+__global__ void h3_cu_adaln_bf16(const uint16_t *input, const uint16_t *norm_weight,
+    const uint16_t *modulation, const unsigned *row_map, uint16_t *output,
+    uint32_t rows, uint32_t width, uint32_t slots, uint32_t shift_slot,
+    uint32_t scale_slot, float epsilon) {
+    uint32_t row = blockIdx.x, tid = threadIdx.x;
+    if (row >= rows) return;
+    const uint16_t *x = input + (size_t)row * width;
+    float local_sum = 0.0f;
+    for (uint32_t k = tid; k < width; k += blockDim.x) {
+        float v = h3_bf16_to_f32(x[k]);
+        local_sum = fmaf(v, v, local_sum);
+    }
+    __shared__ float red[H3_CU_BLOCK];
+    red[tid] = local_sum;
+    __syncthreads();
+    for (int st = (int)blockDim.x / 2; st > 0; st >>= 1) {
+        if (tid < (uint32_t)st) red[tid] += red[tid + st];
+        __syncthreads();
+    }
+    float inverse = rsqrtf(red[0] / (float)width + epsilon);
+    uint32_t base = row_map[row] * slots * width;
+    for (uint32_t col = tid; col < width; col += blockDim.x) {
+        float normed = h3_bf16_to_f32(x[col]) * inverse * h3_bf16_to_f32(norm_weight[col]);
+        float shift = h3_bf16_to_f32(modulation[base + shift_slot * width + col]);
+        float scale = h3_bf16_to_f32(modulation[base + scale_slot * width + col]);
+        output[(size_t)row * width + col] = h3_f32_to_bf16(normed * (1.0f + scale) + shift);
+    }
+}
+
+/* Gate (residual + branch*gate) rounded to bf16, then RMS norm + adaln.
+ * Mirrors h3_gate_adaln_bf16. Width capped at H3_DIT_MAX (5376). */
+__global__ void h3_cu_gate_adaln_bf16(const uint16_t *residual, const uint16_t *branch,
+    const uint16_t *norm_weight, const uint16_t *gate_modulation,
+    const uint16_t *norm_modulation, const unsigned *row_map,
+    uint16_t *gated_residual, uint16_t *output,
+    uint32_t rows, uint32_t width, uint32_t slots, uint32_t gate_slot,
+    uint32_t shift_slot, uint32_t scale_slot, float epsilon) {
+    uint32_t row = blockIdx.x, tid = threadIdx.x;
+    if (row >= rows) return;
+    __shared__ float red[H3_CU_BLOCK];
+    __shared__ uint16_t gated[H3_DIT_MAX];
+    uint32_t base = row_map[row] * slots * width;
+    size_t row_off = (size_t)row * width;
+    float local_sum = 0.0f;
+    for (uint32_t col = tid; col < width; col += blockDim.x) {
+        float gate = h3_bf16_to_f32(gate_modulation[base + gate_slot * width + col]);
+        uint16_t g = h3_f32_to_bf16(h3_bf16_to_f32(residual[row_off + col]) +
+                                    h3_bf16_to_f32(branch[row_off + col]) * gate);
+        gated_residual[row_off + col] = g;
+        gated[col] = g;
+        float v = h3_bf16_to_f32(g);
+        local_sum = fmaf(v, v, local_sum);
+    }
+    red[tid] = local_sum;
+    __syncthreads();
+    for (int st = (int)blockDim.x / 2; st > 0; st >>= 1) {
+        if (tid < (uint32_t)st) red[tid] += red[tid + st];
+        __syncthreads();
+    }
+    float inverse = rsqrtf(red[0] / (float)width + epsilon);
+    for (uint32_t col = tid; col < width; col += blockDim.x) {
+        float normed = h3_bf16_to_f32(gated[col]) * inverse * h3_bf16_to_f32(norm_weight[col]);
+        float shift = h3_bf16_to_f32(norm_modulation[base + shift_slot * width + col]);
+        float scale = h3_bf16_to_f32(norm_modulation[base + scale_slot * width + col]);
+        output[row_off + col] = h3_f32_to_bf16(normed * (1.0f + scale) + shift);
+    }
+}
+
+/* Token pooling: pair.x==pair.y copies first only; else average the pair.
+ * Writes original snapshot, pooled output, and baseline for mapped rows. */
+__global__ void h3_cu_token_pool_bf16(const uint16_t *input, const uint2 *pairs,
+    uint16_t *output, uint16_t *baseline, const unsigned *baseline_indices,
+    uint16_t *original, size_t input_offset, size_t original_offset,
+    size_t baseline_offset, uint32_t rows, uint32_t width) {
+    uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t row = blockIdx.y;
+    if (row >= rows || col >= width) return;
+    uint2 pair = pairs[row];
+    uint16_t first = input[input_offset + (size_t)pair.x * width + col];
+    original[original_offset + (size_t)pair.x * width + col] = first;
+    uint16_t pooled = first;
+    if (pair.x != pair.y) {
+        uint16_t second = input[input_offset + (size_t)pair.y * width + col];
+        original[original_offset + (size_t)pair.y * width + col] = second;
+        pooled = h3_f32_to_bf16((h3_bf16_to_f32(first) + h3_bf16_to_f32(second)) * 0.5f);
+    }
+    output[(size_t)row * width + col] = pooled;
+    uint32_t b_index = baseline_indices[row];
+    if (b_index != 0xffffffffu)
+        baseline[baseline_offset + (size_t)b_index * width + col] = pooled;
+}
+
+/* Token pooling + AdaLN (block per row). Mirrors h3_token_pool_adaln_bf16. */
+__global__ void h3_cu_token_pool_adaln_bf16(const uint16_t *input, const uint2 *pairs,
+    uint16_t *residual, uint16_t *baseline, const unsigned *baseline_indices,
+    uint16_t *original, const uint16_t *norm_weight, const uint16_t *modulation,
+    const unsigned *row_map, uint16_t *output,
+    size_t input_offset, size_t original_offset, size_t baseline_offset,
+    uint32_t rows, uint32_t width, uint32_t slots, uint32_t shift_slot,
+    uint32_t scale_slot, float epsilon) {
+    uint32_t row = blockIdx.x, tid = threadIdx.x;
+    if (row >= rows) return;
+    __shared__ float red[H3_CU_BLOCK];
+    __shared__ uint16_t pooled[H3_DIT_MAX];
+    uint2 pair = pairs[row];
+    uint32_t b_index = baseline_indices[row];
+    float local_sum = 0.0f;
+    for (uint32_t col = tid; col < width; col += blockDim.x) {
+        uint16_t first = input[input_offset + (size_t)pair.x * width + col];
+        original[original_offset + (size_t)pair.x * width + col] = first;
+        uint16_t p = first;
+        if (pair.x != pair.y) {
+            uint16_t second = input[input_offset + (size_t)pair.y * width + col];
+            original[original_offset + (size_t)pair.y * width + col] = second;
+            p = h3_f32_to_bf16((h3_bf16_to_f32(first) + h3_bf16_to_f32(second)) * 0.5f);
+        }
+        size_t dest = (size_t)row * width + col;
+        residual[dest] = p;
+        pooled[col] = p;
+        if (b_index != 0xffffffffu)
+            baseline[baseline_offset + (size_t)b_index * width + col] = p;
+        float v = h3_bf16_to_f32(p);
+        local_sum = fmaf(v, v, local_sum);
+    }
+    red[tid] = local_sum;
+    __syncthreads();
+    for (int st = (int)blockDim.x / 2; st > 0; st >>= 1) {
+        if (tid < (uint32_t)st) red[tid] += red[tid + st];
+        __syncthreads();
+    }
+    float inverse = rsqrtf(red[0] / (float)width + epsilon);
+    uint32_t base = row_map[row] * slots * width;
+    for (uint32_t col = tid; col < width; col += blockDim.x) {
+        float normed = h3_bf16_to_f32(pooled[col]) * inverse * h3_bf16_to_f32(norm_weight[col]);
+        float shift = h3_bf16_to_f32(modulation[base + shift_slot * width + col]);
+        float scale = h3_bf16_to_f32(modulation[base + scale_slot * width + col]);
+        output[(size_t)row * width + col] = h3_f32_to_bf16(normed * (1.0f + scale) + shift);
+    }
+}
+
+/* Token expand (delta): exact-prefix rows copy reduced; else original + update_scale*(reduced-baseline). */
+__global__ void h3_cu_token_expand_delta_bf16(const uint16_t *original, const uint16_t *reduced,
+    const uint16_t *baseline, const unsigned *baseline_indices, const unsigned *parents,
+    uint16_t *output, size_t original_offset, size_t baseline_offset,
+    uint32_t rows, uint32_t width, uint32_t exact_prefix_rows, float update_scale) {
+    uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t row = blockIdx.y;
+    if (row >= rows || col >= width) return;
+    uint32_t parent = parents[row];
+    size_t dest = (size_t)row * width + col;
+    size_t reduced_index = (size_t)parent * width + col;
+    if (row < exact_prefix_rows) {
+        output[dest] = reduced[reduced_index];
+        return;
+    }
+    uint32_t baseline_row = baseline_indices[parent];
+    if (baseline_row == 0xffffffffu) { output[dest] = reduced[reduced_index]; return; }
+    size_t b_index = baseline_offset + (size_t)baseline_row * width + col;
+    float update = h3_bf16_to_f32(reduced[reduced_index]) - h3_bf16_to_f32(baseline[b_index]);
+    output[dest] = h3_f32_to_bf16(h3_bf16_to_f32(original[original_offset + dest]) + update_scale * update);
+}
+
+/* Token expand + AdaLN (block per row). Mirrors h3_token_expand_adaln_bf16. */
+__global__ void h3_cu_token_expand_adaln_bf16(const uint16_t *original, const uint16_t *reduced,
+    const uint16_t *baseline, const unsigned *baseline_indices, const unsigned *parents,
+    const uint16_t *norm_weight, const uint16_t *modulation, const unsigned *row_map,
+    uint16_t *residual, uint16_t *output,
+    size_t original_offset, size_t baseline_offset,
+    uint32_t rows, uint32_t width, uint32_t exact_prefix_rows, float update_scale,
+    uint32_t slots, uint32_t shift_slot, uint32_t scale_slot, float epsilon) {
+    uint32_t row = blockIdx.x, tid = threadIdx.x;
+    if (row >= rows) return;
+    __shared__ float red[H3_CU_BLOCK];
+    __shared__ uint16_t restored[H3_DIT_MAX];
+    uint32_t parent = parents[row];
+    uint32_t baseline_row = baseline_indices[parent];
+    bool direct = row < exact_prefix_rows || baseline_row == 0xffffffffu;
+    float local_sum = 0.0f;
+    for (uint32_t col = tid; col < width; col += blockDim.x) {
+        size_t dest = (size_t)row * width + col;
+        size_t reduced_index = (size_t)parent * width + col;
+        uint16_t r = reduced[reduced_index];
+        if (!direct) {
+            size_t b_index = baseline_offset + (size_t)baseline_row * width + col;
+            float update = h3_bf16_to_f32(r) - h3_bf16_to_f32(baseline[b_index]);
+            r = h3_f32_to_bf16(h3_bf16_to_f32(original[original_offset + dest]) + update_scale * update);
+        }
+        restored[col] = r;
+        residual[dest] = r;
+        float v = h3_bf16_to_f32(r);
+        local_sum = fmaf(v, v, local_sum);
+    }
+    red[tid] = local_sum;
+    __syncthreads();
+    for (int st = (int)blockDim.x / 2; st > 0; st >>= 1) {
+        if (tid < (uint32_t)st) red[tid] += red[tid + st];
+        __syncthreads();
+    }
+    float inverse = rsqrtf(red[0] / (float)width + epsilon);
+    uint32_t base = row_map[row] * slots * width;
+    for (uint32_t col = tid; col < width; col += blockDim.x) {
+        float normed = h3_bf16_to_f32(restored[col]) * inverse * h3_bf16_to_f32(norm_weight[col]);
+        float shift = h3_bf16_to_f32(modulation[base + shift_slot * width + col]);
+        float scale = h3_bf16_to_f32(modulation[base + scale_slot * width + col]);
+        output[(size_t)row * width + col] = h3_f32_to_bf16(normed * (1.0f + scale) + shift);
+    }
+}
+
+/* Euler sampler step: sample += delta*(ratio*(last-prev)+last). */
+__global__ void h3_cu_euler_bf16(float *sample, const uint16_t *last, const uint16_t *previous,
+    size_t sample_offset, uint32_t elements, float delta, float ratio) {
+    uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= elements) return;
+    float lv = h3_bf16_to_f32(last[gid]);
+    float velocity = fmaf(ratio, lv - h3_bf16_to_f32(previous[gid]), lv);
+    sample[sample_offset + gid] = fmaf(delta, velocity, sample[sample_offset + gid]);
+}
+
+/* Text RoPE, in place on query/key. Row-major [row, head, dim], pairs half_dim. */
+__global__ void h3_cu_rope_text_bf16(uint16_t *query, uint16_t *key,
+    const float *rope_cos, const float *rope_sin,
+    uint32_t sequence, uint32_t query_heads, uint32_t kv_heads, uint32_t head_dim) {
+    uint32_t head = blockIdx.x, row = blockIdx.y, d = threadIdx.x;
+    if (row >= sequence || d >= head_dim / 2) return;
+    uint32_t half_dim = head_dim / 2;
+    if (head < query_heads) {
+        size_t base = ((size_t)row * query_heads + head) * head_dim;
+        float first = h3_bf16_to_f32(query[base + d]);
+        float second = h3_bf16_to_f32(query[base + half_dim + d]);
+        float c = rope_cos[(size_t)row * half_dim + d];
+        float s = rope_sin[(size_t)row * half_dim + d];
+        query[base + d] = h3_f32_to_bf16(first * c - second * s);
+        query[base + half_dim + d] = h3_f32_to_bf16(second * c + first * s);
+    }
+    if (head < kv_heads) {
+        size_t base = ((size_t)row * kv_heads + head) * head_dim;
+        float first = h3_bf16_to_f32(key[base + d]);
+        float second = h3_bf16_to_f32(key[base + half_dim + d]);
+        float c = rope_cos[(size_t)row * half_dim + d];
+        float s = rope_sin[(size_t)row * half_dim + d];
+        key[base + d] = h3_f32_to_bf16(first * c - second * s);
+        key[base + half_dim + d] = h3_f32_to_bf16(second * c + first * s);
+    }
+}
+
+/* Grouped multi-head causal attention (text encoder). Mirrors h3_gqa_causal_bf16:
+ * Q scaled (bf16-rounded) then softmax(QK^T/scale) causal, weighted V. */
+extern __shared__ float h3_cu_dyn[];
+__global__ void h3_cu_gqa_causal_bf16(const uint16_t *q, const uint16_t *k, const uint16_t *v,
+    uint16_t *out, uint32_t sequence, uint32_t q_heads, uint32_t kv_heads,
+    uint32_t head_dim, float scale) {
+    uint32_t q_row = blockIdx.x, q_head = blockIdx.y, tid = threadIdx.x;
+    uint32_t threads = blockDim.x;
+    if (q_row >= sequence || q_head >= q_heads) return;
+    uint32_t kv_head = q_head / (q_heads / kv_heads);
+    size_t q_base = ((size_t)q_row * q_heads + q_head) * head_dim;
+    uint32_t key_count = q_row + 1;
+    float *shared_query = h3_cu_dyn;
+    float *scores = h3_cu_dyn + head_dim;
+    float *red = h3_cu_dyn + head_dim + sequence;
+    for (uint32_t d = tid; d < head_dim; d += threads)
+        shared_query[d] = h3_bf16_to_f32(h3_f32_to_bf16(h3_bf16_to_f32(q[q_base + d]) * scale));
+    __syncthreads();
+    float local_max = -INFINITY;
+    for (uint32_t kr = tid; kr < key_count; kr += threads) {
+        size_t k_base = ((size_t)kr * kv_heads + kv_head) * head_dim;
+        float dot = 0.0f;
+        for (uint32_t d = 0; d < head_dim; d++)
+            dot = fmaf(shared_query[d], h3_bf16_to_f32(k[k_base + d]), dot);
+        scores[kr] = dot;
+        local_max = fmaxf(local_max, dot);
+    }
+    red[tid] = local_max;
+    __syncthreads();
+    for (int st = (int)threads / 2; st > 0; st >>= 1) {
+        if (tid < (uint32_t)st) red[tid] = fmaxf(red[tid], red[tid + st]);
+        __syncthreads();
+    }
+    float maximum = red[0];
+    float local_sum = 0.0f;
+    for (uint32_t kr = tid; kr < key_count; kr += threads) {
+        float p = expf(scores[kr] - maximum);
+        scores[kr] = p;
+        local_sum += p;
+    }
+    red[tid] = local_sum;
+    __syncthreads();
+    for (int st = (int)threads / 2; st > 0; st >>= 1) {
+        if (tid < (uint32_t)st) red[tid] += red[tid + st];
+        __syncthreads();
+    }
+    float inv_sum = 1.0f / red[0];
+    for (uint32_t d = tid; d < head_dim; d += threads) {
+        float sum = 0.0f;
+        for (uint32_t kr = 0; kr < key_count; kr++) {
+            size_t v_index = ((size_t)kr * kv_heads + kv_head) * head_dim + d;
+            sum = fmaf(scores[kr] * inv_sum, h3_bf16_to_f32(v[v_index]), sum);
+        }
+        out[q_base + d] = h3_f32_to_bf16(sum);
+    }
 }
 
 
@@ -534,9 +881,9 @@ static void h3_cuda_seterr(const h3_gpu *gpu) {
     if (gpu) snprintf(((h3_gpu *)gpu)->error, sizeof(((h3_gpu *)gpu)->error), "%s", H3_CUDA_ERR);
 }
 
-int h3_gpu_is_m5(const h3_gpu *gpu) { h3_cuda_seterr(gpu); return (int)0; }
-int h3_gpu_has_nax_mlp(const h3_gpu *gpu) { h3_cuda_seterr(gpu); return (int)0; }
-int h3_gpu_has_int8_mlp(const h3_gpu *gpu) { h3_cuda_seterr(gpu); return (int)0; }
+int h3_gpu_is_m5(const h3_gpu *gpu) { (void)gpu; return 0; }
+int h3_gpu_has_nax_mlp(const h3_gpu *gpu) { (void)gpu; return 0; }
+int h3_gpu_has_int8_mlp(const h3_gpu *gpu) { (void)gpu; return 0; }
 h3_gpu_tensor * h3_gpu_tensor_new_f32(h3_gpu *gpu, size_t elements) {
     return h3_gpu_tensor_alloc(gpu, elements, H3_GPU_F32, NULL);
 }
@@ -689,7 +1036,29 @@ int h3_gpu_patch_linear_bf16_offset(
                              const h3_gpu_tensor *input, size_t input_offset,
                              const h3_gpu_tensor *weight,
                              const h3_gpu_tensor *bias, uint32_t rows,
-                             uint32_t input_dim, uint32_t output_dim) { h3_cuda_seterr(gpu); return (int)0; }
+                             uint32_t input_dim, uint32_t output_dim) {
+    if (!gpu || !output || !input || !weight || !output->device_ptr ||
+        !input->device_ptr || !weight->device_ptr) return 0;
+    /* F32 input/weight -> BF16 output projection. GEMM to temp f32, then bias+round. */
+    h3_gpu_tensor *tmp = h3_gpu_tensor_new_f32(gpu, (size_t)rows * output_dim);
+    if (!tmp) return 0;
+    const void *in = (const float *)input->device_ptr + input_offset;
+    cublasStatus_t st = h3_cu_gemm(gpu, CUDA_R_32F, CUDA_R_32F, CUBLAS_COMPUTE_32F,
+                                   weight->device_ptr, in, tmp->device_ptr,
+                                   rows, input_dim, output_dim);
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        snprintf(((h3_gpu *)gpu)->error, sizeof(((h3_gpu *)gpu)->error),
+                 "cublasGemmEx patch f32 failed (%d)", (int)st);
+        h3_gpu_tensor_free(tmp);
+        return 0;
+    }
+    uint16_t *out = (uint16_t *)output->device_ptr + output_offset;
+    h3_cu_bias_f32_to_bf16<<<h3_cu_grid(rows * output_dim), H3_CU_BLOCK>>>(
+        (const float *)tmp->device_ptr, bias ? (const float *)bias->device_ptr : NULL,
+        out, rows, output_dim);
+    h3_gpu_tensor_free(tmp);
+    return 1;
+}
 int h3_gpu_patch_linear_bf16_map(
                              h3_gpu *gpu, h3_gpu_tensor *output,
                              const h3_gpu_tensor *input,
@@ -697,7 +1066,31 @@ int h3_gpu_patch_linear_bf16_map(
                              const h3_gpu_tensor *bias,
                              const h3_gpu_tensor *row_map,
                              uint32_t output_rows, uint32_t rows,
-                             uint32_t input_dim, uint32_t output_dim) { h3_cuda_seterr(gpu); return (int)0; }
+                             uint32_t input_dim, uint32_t output_dim) {
+    if (!gpu || !output || !input || !weight || !row_map || !output->device_ptr ||
+        !input->device_ptr || !weight->device_ptr || !row_map->device_ptr) return 0;
+    /* Gather input rows by row_map into a temp, then patch_linear. */
+    h3_gpu_tensor *gathered = h3_gpu_tensor_new_f32(gpu, (size_t)rows * input_dim);
+    if (!gathered) return 0;
+    /* gather kernel: gathered[r*in+d] = input[row_map[r]*in+d] */
+    dim3 g(h3_cu_grid(input_dim), rows);
+    h3_cu_copy_rows_f32<<<g, H3_CU_BLOCK>>>((const float *)input->device_ptr,
+        (const unsigned *)row_map->device_ptr, (float *)gathered->device_ptr,
+        rows, input_dim);
+    int ok = h3_gpu_patch_linear_bf16_offset(
+        gpu, output, 0, gathered, 0, weight, bias, rows, input_dim, output_dim);
+    h3_gpu_tensor_free(gathered);
+    (void)output_rows;
+    return ok;
+}
+int h3_gpu_patch_linear_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                             const h3_gpu_tensor *input,
+                             const h3_gpu_tensor *weight,
+                             const h3_gpu_tensor *bias, uint32_t rows,
+                             uint32_t input_dim, uint32_t output_dim) {
+    return h3_gpu_patch_linear_bf16_offset(gpu, output, 0, input, 0, weight,
+                                           bias, rows, input_dim, output_dim);
+}
 int h3_gpu_silu_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *input, uint32_t elements) {
     if (!output || !input || output->dtype != H3_GPU_F32 || input->dtype != H3_GPU_F32 || elements > input->elements || elements > output->elements) return 0;
@@ -965,7 +1358,19 @@ int h3_gpu_mlp_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *fc1_weight,
                     const h3_gpu_tensor *fc2_weight, uint32_t rows,
                     uint32_t input_dim, uint32_t hidden_dim,
-                    uint32_t output_dim) { h3_cuda_seterr(gpu); return (int)0; }
+                    uint32_t output_dim) {
+    if (!gpu || !output || !input || !fc1_weight || !fc2_weight ||
+        !output->device_ptr || !input->device_ptr || !fc1_weight->device_ptr ||
+        !fc2_weight->device_ptr) return 0;
+    h3_gpu_tensor *fc1 = h3_gpu_tensor_new_bf16(gpu, (size_t)rows * hidden_dim * 2);
+    h3_gpu_tensor *act = h3_gpu_tensor_new_bf16(gpu, (size_t)rows * hidden_dim);
+    if (!fc1 || !act) { if (fc1) h3_gpu_tensor_free(fc1); if (act) h3_gpu_tensor_free(act); return 0; }
+    int ok = h3_gpu_linear_bf16(gpu, fc1, input, fc1_weight, NULL, rows, input_dim, hidden_dim * 2)
+        && h3_gpu_swiglu_bf16(gpu, act, fc1, rows, hidden_dim)
+        && h3_gpu_linear_bf16(gpu, output, act, fc2_weight, NULL, rows, hidden_dim, output_dim);
+    h3_gpu_tensor_free(fc1); h3_gpu_tensor_free(act);
+    return ok;
+}
 int h3_gpu_mlp_nax_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                         h3_gpu_tensor *activated,
                         const h3_gpu_tensor *input,
@@ -1056,14 +1461,33 @@ int h3_gpu_adaln_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                       const h3_gpu_tensor *modulation,
                       const h3_gpu_tensor *row_map, uint32_t rows,
                       uint32_t width, uint32_t slots, uint32_t shift_slot,
-                      uint32_t scale_slot, float epsilon) { h3_cuda_seterr(gpu); return (int)0; }
+                      uint32_t scale_slot, float epsilon) {
+    if (!gpu || !output || !input || !norm_weight || !modulation || !row_map ||
+        !output->device_ptr || !input->device_ptr || !norm_weight->device_ptr ||
+        !modulation->device_ptr || !row_map->device_ptr) return 0;
+    h3_cu_adaln_bf16<<<rows, H3_CU_BLOCK>>>((const uint16_t *)input->device_ptr,
+        (const uint16_t *)norm_weight->device_ptr, (const uint16_t *)modulation->device_ptr,
+        (const unsigned *)row_map->device_ptr, (uint16_t *)output->device_ptr,
+        rows, width, slots, shift_slot, scale_slot, epsilon);
+    return 1;
+}
 int h3_gpu_adaln_bf16_offset(h3_gpu *gpu, h3_gpu_tensor *output,
                       const h3_gpu_tensor *input, size_t input_offset,
                       const h3_gpu_tensor *norm_weight,
                       const h3_gpu_tensor *modulation,
                       const h3_gpu_tensor *row_map, uint32_t rows,
                       uint32_t width, uint32_t slots, uint32_t shift_slot,
-                      uint32_t scale_slot, float epsilon) { h3_cuda_seterr(gpu); return (int)0; }
+                      uint32_t scale_slot, float epsilon) {
+    if (!gpu || !output || !input || !norm_weight || !modulation || !row_map ||
+        !output->device_ptr || !input->device_ptr || !norm_weight->device_ptr ||
+        !modulation->device_ptr || !row_map->device_ptr) return 0;
+    h3_cu_adaln_bf16<<<rows, H3_CU_BLOCK>>>(
+        (const uint16_t *)input->device_ptr + input_offset,
+        (const uint16_t *)norm_weight->device_ptr, (const uint16_t *)modulation->device_ptr,
+        (const unsigned *)row_map->device_ptr, (uint16_t *)output->device_ptr,
+        rows, width, slots, shift_slot, scale_slot, epsilon);
+    return 1;
+}
 int h3_gpu_adaln_linear_bf16(
                       h3_gpu *gpu, h3_gpu_tensor *output,
                       h3_gpu_tensor *inverse,
@@ -1075,7 +1499,25 @@ int h3_gpu_adaln_linear_bf16(
                       const h3_gpu_tensor *bias, uint32_t rows,
                       uint32_t width, uint32_t output_dim, uint32_t slots,
                       uint32_t shift_slot, uint32_t scale_slot,
-                      float epsilon) { h3_cuda_seterr(gpu); return (int)0; }
+                      float epsilon) {
+    if (!gpu || !output || !inverse || !input || !norm_weight || !modulation ||
+        !row_map || !weight || !output->device_ptr || !input->device_ptr ||
+        !norm_weight->device_ptr || !modulation->device_ptr || !row_map->device_ptr ||
+        !weight->device_ptr) return 0;
+    h3_cu_rms_inverse_bf16<<<rows, H3_CU_BLOCK>>>(
+        (const uint16_t *)input->device_ptr + input_offset, (float *)inverse->device_ptr,
+        rows, width, epsilon);
+    h3_gpu_tensor *tmp = h3_gpu_tensor_new_bf16(gpu, (size_t)rows * width);
+    if (!tmp) return 0;
+    h3_cu_adaln_bf16<<<rows, H3_CU_BLOCK>>>(
+        (const uint16_t *)input->device_ptr + input_offset,
+        (const uint16_t *)norm_weight->device_ptr, (const uint16_t *)modulation->device_ptr,
+        (const unsigned *)row_map->device_ptr, (uint16_t *)tmp->device_ptr,
+        rows, width, slots, shift_slot, scale_slot, epsilon);
+    int ok = h3_gpu_linear_bf16(gpu, output, tmp, weight, bias, rows, width, output_dim);
+    h3_gpu_tensor_free(tmp);
+    return ok;
+}
 int h3_gpu_gate_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *residual,
                      const h3_gpu_tensor *branch,
@@ -1098,7 +1540,22 @@ int h3_gpu_gate_adaln_bf16(
                      const h3_gpu_tensor *row_map, uint32_t rows,
                      uint32_t width, uint32_t slots, uint32_t gate_slot,
                      uint32_t shift_slot, uint32_t scale_slot,
-                     float epsilon) { h3_cuda_seterr(gpu); return (int)0; }
+                     float epsilon) {
+    if (!gpu || !gated_residual || !output || !residual || !branch || !norm_weight ||
+        !gate_modulation || !norm_modulation || !row_map || width > H3_DIT_MAX ||
+        !gated_residual->device_ptr || !output->device_ptr || !residual->device_ptr ||
+        !branch->device_ptr || !norm_weight->device_ptr || !gate_modulation->device_ptr ||
+        !norm_modulation->device_ptr || !row_map->device_ptr) return 0;
+    h3_cu_gate_adaln_bf16<<<rows, H3_CU_BLOCK>>>(
+        (const uint16_t *)residual->device_ptr, (const uint16_t *)branch->device_ptr,
+        (const uint16_t *)norm_weight->device_ptr,
+        (const uint16_t *)gate_modulation->device_ptr,
+        (const uint16_t *)norm_modulation->device_ptr,
+        (const unsigned *)row_map->device_ptr,
+        (uint16_t *)gated_residual->device_ptr, (uint16_t *)output->device_ptr,
+        rows, width, slots, gate_slot, shift_slot, scale_slot, epsilon);
+    return 1;
+}
 int h3_gpu_gate_adaln_quantize_int8(
                      h3_gpu *gpu, h3_gpu_tensor *gated_residual,
                      h3_gpu_tensor *quantized_output,
@@ -1159,7 +1616,12 @@ int h3_gpu_grouped_qkv_linear_rope_bf16(
                                  const h3_gpu_tensor *rope_sin,
                                  uint32_t rows, uint32_t input_dim,
                                  uint32_t heads, uint32_t head_dim,
-                                 uint32_t rope_half, float epsilon) { h3_cuda_seterr(gpu); return (int)0; }
+                                 uint32_t rope_half, float epsilon) {
+    uint32_t inner = heads * head_dim;
+    if (!h3_gpu_linear_bf16(gpu, qkv, input, weight, NULL, rows, input_dim, inner * 3)) return 0;
+    return h3_gpu_grouped_qkv_rope_bf16(gpu, query, key, value, qkv, q_norm, k_norm,
+        rope_cos, rope_sin, rows, heads, head_dim, rope_half, epsilon);
+}
 int h3_gpu_grouped_qkv_linear_rope_int8(
                                  h3_gpu *gpu,
                                  h3_gpu_tensor *query,
@@ -1250,14 +1712,34 @@ int h3_gpu_rope_text_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
                           const h3_gpu_tensor *rope_cos_f32,
                           const h3_gpu_tensor *rope_sin_f32,
                           uint32_t sequence, uint32_t query_heads,
-                          uint32_t kv_heads, uint32_t head_dim) { h3_cuda_seterr(gpu); return (int)0; }
+                          uint32_t kv_heads, uint32_t head_dim) {
+    if (!gpu || !query || !key || !rope_cos_f32 || !rope_sin_f32 ||
+        !query->device_ptr || !key->device_ptr || !rope_cos_f32->device_ptr ||
+        !rope_sin_f32->device_ptr) return 0;
+    uint32_t max_head = query_heads > kv_heads ? query_heads : kv_heads;
+    dim3 g(max_head, sequence);
+    h3_cu_rope_text_bf16<<<g, H3_CU_BLOCK>>>((uint16_t *)query->device_ptr,
+        (uint16_t *)key->device_ptr, (const float *)rope_cos_f32->device_ptr,
+        (const float *)rope_sin_f32->device_ptr, sequence, query_heads, kv_heads, head_dim);
+    return 1;
+}
 int h3_gpu_gqa_causal_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                            const h3_gpu_tensor *query,
                            const h3_gpu_tensor *key,
                            const h3_gpu_tensor *value,
                            uint32_t sequence, uint32_t query_heads,
                            uint32_t kv_heads, uint32_t head_dim,
-                           float scale) { h3_cuda_seterr(gpu); return (int)0; }
+                           float scale) {
+    if (!gpu || !output || !query || !key || !value || !output->device_ptr ||
+        !query->device_ptr || !key->device_ptr || !value->device_ptr) return 0;
+    dim3 g(sequence, query_heads);
+    size_t dyn = (head_dim + sequence + H3_CU_BLOCK) * sizeof(float);
+    h3_cu_gqa_causal_bf16<<<g, H3_CU_BLOCK, dyn>>>(
+        (const uint16_t *)query->device_ptr, (const uint16_t *)key->device_ptr,
+        (const uint16_t *)value->device_ptr, (uint16_t *)output->device_ptr,
+        sequence, query_heads, kv_heads, head_dim, scale);
+    return 1;
+}
 int h3_gpu_add_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *left, const h3_gpu_tensor *right,
                     uint32_t elements) {
@@ -1282,7 +1764,19 @@ int h3_gpu_token_pool_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                            const h3_gpu_tensor *baseline_indices,
                            const h3_gpu_tensor *pairs, uint32_t input_rows,
                            uint32_t rows, uint32_t baseline_rows,
-                           uint32_t width) { h3_cuda_seterr(gpu); return (int)0; }
+                           uint32_t width) {
+    if (!gpu || !output || !input || !original || !baseline || !baseline_indices || !pairs ||
+        !output->device_ptr || !input->device_ptr || !original->device_ptr ||
+        !baseline->device_ptr || !baseline_indices->device_ptr || !pairs->device_ptr) return 0;
+    dim3 g(h3_cu_grid(width), rows);
+    h3_cu_token_pool_bf16<<<g, H3_CU_BLOCK>>>(
+        (const uint16_t *)input->device_ptr, (const uint2 *)pairs->device_ptr,
+        (uint16_t *)output->device_ptr, (uint16_t *)baseline->device_ptr,
+        (const unsigned *)baseline_indices->device_ptr, (uint16_t *)original->device_ptr,
+        input_offset, original_offset, baseline_offset, rows, width);
+    (void)input_rows; (void)baseline_rows;
+    return 1;
+}
 int h3_gpu_token_pool_adaln_bf16(
                            h3_gpu *gpu, h3_gpu_tensor *residual,
                            h3_gpu_tensor *output,
@@ -1297,7 +1791,24 @@ int h3_gpu_token_pool_adaln_bf16(
                            uint32_t input_rows, uint32_t rows,
                            uint32_t baseline_rows, uint32_t width,
                            uint32_t slots, uint32_t shift_slot,
-                           uint32_t scale_slot, float epsilon) { h3_cuda_seterr(gpu); return (int)0; }
+                           uint32_t scale_slot, float epsilon) {
+    if (!gpu || !residual || !output || !input || !original || !baseline ||
+        !baseline_indices || !pairs || !norm_weight || !modulation || !row_map ||
+        width > H3_DIT_MAX || !residual->device_ptr || !output->device_ptr ||
+        !input->device_ptr || !original->device_ptr || !baseline->device_ptr ||
+        !baseline_indices->device_ptr || !pairs->device_ptr || !norm_weight->device_ptr ||
+        !modulation->device_ptr || !row_map->device_ptr) return 0;
+    h3_cu_token_pool_adaln_bf16<<<rows, H3_CU_BLOCK>>>(
+        (const uint16_t *)input->device_ptr, (const uint2 *)pairs->device_ptr,
+        (uint16_t *)residual->device_ptr, (uint16_t *)baseline->device_ptr,
+        (const unsigned *)baseline_indices->device_ptr, (uint16_t *)original->device_ptr,
+        (const uint16_t *)norm_weight->device_ptr, (const uint16_t *)modulation->device_ptr,
+        (const unsigned *)row_map->device_ptr, (uint16_t *)output->device_ptr,
+        input_offset, original_offset, baseline_offset, rows, width, slots,
+        shift_slot, scale_slot, epsilon);
+    (void)input_rows; (void)baseline_rows;
+    return 1;
+}
 int h3_gpu_token_expand_delta_bf16(
                            h3_gpu *gpu, h3_gpu_tensor *output,
                            const h3_gpu_tensor *original,
@@ -1310,7 +1821,19 @@ int h3_gpu_token_expand_delta_bf16(
                            uint32_t reduced_rows, uint32_t baseline_rows,
                            uint32_t width,
                            uint32_t exact_prefix_rows,
-                           float update_scale) { h3_cuda_seterr(gpu); return (int)0; }
+                           float update_scale) {
+    if (!gpu || !output || !original || !reduced || !baseline || !baseline_indices || !parents ||
+        !output->device_ptr || !original->device_ptr || !reduced->device_ptr ||
+        !baseline->device_ptr || !baseline_indices->device_ptr || !parents->device_ptr) return 0;
+    dim3 g(h3_cu_grid(width), rows);
+    h3_cu_token_expand_delta_bf16<<<g, H3_CU_BLOCK>>>(
+        (const uint16_t *)original->device_ptr, (const uint16_t *)reduced->device_ptr,
+        (const uint16_t *)baseline->device_ptr, (const unsigned *)baseline_indices->device_ptr,
+        (const unsigned *)parents->device_ptr, (uint16_t *)output->device_ptr,
+        original_offset, baseline_offset, rows, width, exact_prefix_rows, update_scale);
+    (void)reduced_rows; (void)baseline_rows;
+    return 1;
+}
 int h3_gpu_token_expand_adaln_bf16(
                            h3_gpu *gpu, h3_gpu_tensor *residual,
                            h3_gpu_tensor *output,
@@ -1328,11 +1851,35 @@ int h3_gpu_token_expand_adaln_bf16(
                            uint32_t baseline_rows, uint32_t width,
                            uint32_t exact_prefix_rows, float update_scale,
                            uint32_t slots, uint32_t shift_slot,
-                           uint32_t scale_slot, float epsilon) { h3_cuda_seterr(gpu); return (int)0; }
+                           uint32_t scale_slot, float epsilon) {
+    if (!gpu || !residual || !output || !original || !reduced || !baseline ||
+        !baseline_indices || !parents || !norm_weight || !modulation || !row_map ||
+        width > H3_DIT_MAX || !residual->device_ptr || !output->device_ptr ||
+        !original->device_ptr || !reduced->device_ptr || !baseline->device_ptr ||
+        !baseline_indices->device_ptr || !parents->device_ptr || !norm_weight->device_ptr ||
+        !modulation->device_ptr || !row_map->device_ptr) return 0;
+    h3_cu_token_expand_adaln_bf16<<<rows, H3_CU_BLOCK>>>(
+        (const uint16_t *)original->device_ptr, (const uint16_t *)reduced->device_ptr,
+        (const uint16_t *)baseline->device_ptr, (const unsigned *)baseline_indices->device_ptr,
+        (const unsigned *)parents->device_ptr, (const uint16_t *)norm_weight->device_ptr,
+        (const uint16_t *)modulation->device_ptr, (const unsigned *)row_map->device_ptr,
+        (uint16_t *)residual->device_ptr, (uint16_t *)output->device_ptr,
+        original_offset, baseline_offset, rows, width, exact_prefix_rows, update_scale,
+        slots, shift_slot, scale_slot, epsilon);
+    (void)reduced_rows; (void)baseline_rows;
+    return 1;
+}
 int h3_gpu_euler_bf16(h3_gpu *gpu, h3_gpu_tensor *sample,
                       size_t sample_offset, const h3_gpu_tensor *last,
                       const h3_gpu_tensor *previous, uint32_t elements,
-                      float delta, float ratio) { h3_cuda_seterr(gpu); return (int)0; }
+                      float delta, float ratio) {
+    if (!gpu || !sample || !last || !previous || !sample->device_ptr ||
+        !last->device_ptr || !previous->device_ptr) return 0;
+    h3_cu_euler_bf16<<<h3_cu_grid(elements), H3_CU_BLOCK>>>(
+        (float *)sample->device_ptr, (const uint16_t *)last->device_ptr,
+        (const uint16_t *)previous->device_ptr, sample_offset, elements, delta, ratio);
+    return 1;
+}
 int h3_gpu_silu_mul_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                          const h3_gpu_tensor *gate,
                          const h3_gpu_tensor *up, uint32_t elements) {
